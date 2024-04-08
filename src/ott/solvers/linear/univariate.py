@@ -144,9 +144,11 @@ class UnivariateSolver:
       self,
       num_subsamples: Optional[int] = None,
       quantiles: Optional[Union[int, jnp.ndarray]] = None,
+      use_gauss_seidel: Optional[bool] = None
   ):
     self._quantiles = quantiles
     self.num_subsamples = num_subsamples
+    self.use_gauss_seidel = use_gauss_seidel
 
   @property
   def quantiles(self) -> Optional[jnp.ndarray]:
@@ -212,6 +214,11 @@ class UnivariateSolver:
     elif is_uniform_same_size:
       return_transport = return_transport and not self.num_subsamples
       out = uniform_distance(x, y, geom.cost_fn, return_transport)
+    elif self.use_gauss_seidel:
+      fn = jax.vmap(
+          gauss_seidel_1D_solver, in_axes=[1, 1, None, None, None]
+      )
+      out = fn(x, y, geom.cost_fn, prob.a, prob.b)
     else:
       fn = jax.vmap(
           quantile_distance, in_axes=[1, 1, None, None, None, None, None]
@@ -220,6 +227,7 @@ class UnivariateSolver:
           x, y, geom.cost_fn, prob.a, prob.b, return_transport,
           return_dual_vectors
       )
+
 
     return UnivariateOutput(prob, *out)
 
@@ -393,36 +401,13 @@ def _quant_dist(
   return ot_costs / n_q, None, None, None, None
 
 
-@jax.tree_util.register_pytree_node_class
-class GSUnivariateOutput(NamedTuple):  # noqa: D101
-  """Output of the :class:`~ott.solvers.linear.GSUnivariateSolver`.
-
-  Objects of this class contain both solutions and problem definition of a
-  univariate OT problem.
-
-  Args:
-    prob: OT problem between 2 weighted ``[n, d]`` and ``[m, d]`` point clouds.
-    P: ``[n,m]`` array optimal coupling matrix
-    dual_a: ``[n,]`` array of dual values
-    dual_b: ``[m,]`` array of dual values
-  """
-  prob: linear_problem.LinearProblem
-  dual_a: jnp.ndarray
-  dual_b: jnp.ndarray
-
-  def tree_flatten(self):  # noqa: D102
-    return None, (self.num_subsamples, self._quantiles)
-
-  @classmethod
-  def tree_unflatten(cls, aux_data, children):  # noqa: D102
-    del children
-    return cls(*aux_data)
-
-def gauss_seidel_1Dsolver(x: jnp.ndarray, 
-                          y: jnp.ndarray, 
-                          a: jnp.ndarray, 
-                          b: jnp.ndarray, 
-                          cost_fn: costs.TICost,):
+def gauss_seidel_1D_solver(x: jnp.ndarray,
+                           y: jnp.ndarray,
+                           cost_fn: costs.TICost,
+                           a: jnp.ndarray,
+                           b: jnp.ndarray,
+                           *args, **kwargs
+                        ) -> Distance_t:
     """Computes Univariate Distance between 1D point clouds.
 
     Args:
@@ -433,9 +418,21 @@ def gauss_seidel_1Dsolver(x: jnp.ndarray,
       cost_fn: Transport cost function, i.e. ``c: \mathbb{R} \times \mathbb{R} \rightarrow \mathbb{R} `.
 
     Returns:
-        P: ``[n,m]`` array optimal coupling matrix
-        dual_a: ``[n,]`` array of dual values
-        dual_b: ``[m,]`` array of dual values
+      optimal transport cost: float
+      paired_indices: ``None`` if no transport was computed / recorded (e.g. when
+        using quantiles or subsampling approximations). Otherwise, output a tensor
+        of shape ``[d, 2, m+n]``, of ``m+n`` pairs of indices, for which the
+        optimal transport assigns mass, on each slice of the ``d`` slices
+        described in the dataset. Namely, for each index ``0<=k<m+n``, ``0<=s<d``,
+        if one has ``i:=paired_indices[s,0,k]`` and ``j:=paired_indices[s,1,k]``,
+        then point ``i`` in the first point cloud sends mass to point ``j`` in the
+        second, in slice ``s``.
+      mass_paired_indices: ``[d, n+m]`` array of weights. Using notation above, if
+        ``0<=k<n+m``, and ``0<=s<d``  then writing ``i:=paired_indices[s,0,k]``
+        and ``j=paired_indices[s,1,k]``, point ``i`` sends
+          ``mass_paired_indices[s,k]`` to point ``j``.
+      dual_a: ``[n,]`` array of dual values
+      dual_b: ``[m,]`` array of dual values
     """
 
     # sort entries
@@ -443,6 +440,8 @@ def gauss_seidel_1Dsolver(x: jnp.ndarray,
     y, i_y = mu.sort_and_argsort(y, argsort=True)
     a = a[i_x]
     b = b[i_y]
+    a_original = a.copy
+    b_original = b.copy
 
     # compute cost matrix
     cost_matrix = cost_fn.pairwise(x, y)
@@ -451,101 +450,44 @@ def gauss_seidel_1Dsolver(x: jnp.ndarray,
 
     # cumulative idx
     q = m+n-1
-    I = J = jnp.zeros(q, dtype=int)
-
-    # transport matrix
-    P = jnp.zeros((n,m))
+    paired_indices = jnp.zeros((2,q), dtype=int)
+    mass_paired_indices = jnp.zeros(q)
                   
     # init duals
     dual_a, dual_b = jnp.zeros(n), jnp.zeros(m)
     dual_b = dual_b.at[0].set(cost_matrix[0,0])
 
     # helper functions
-    def dual_a_update(I, J, dual_a, dual_b, i, j, k):
-      I = I.at[k+1].set(i+1)
-      J = J.at[k+1].set(j)
+    def dual_a_update(paired_indices, dual_a, dual_b, i, j, k):
+      paired_indices = paired_indices.at[:,k+1].set(jnp.array([i+1, j]))
       dual_a = dual_a.at[i+1].set(cost_matrix[i+1,j] - dual_b[j])
-      return I, J, dual_a, dual_b
+      return paired_indices, dual_a, dual_b
 
-    def dual_b_update(I, J, dual_a, dual_b, i, j, k):
-      I = I.at[k+1].set(i)
-      J = J.at[k+1].set(j+1)
+    def dual_b_update(paired_indices, dual_a, dual_b, i, j, k):
+      paired_indices = paired_indices.at[:,k+1].set(jnp.array([i, j+1]))
       dual_b = dual_b.at[j+1].set(cost_matrix[i,j+1] - dual_a[i])
-      return I, J, dual_a, dual_b
+      return paired_indices, dual_a, dual_b
 
     def body_fun(k, val):
-      (P, I, J, a, b, dual_a, dual_b) = val
-      i, j  = I[k], J[k]
-      I, J, dual_a, dual_b = jax.lax.cond(a[i]<b[j],
+      (mass_paired_indices, paired_indices, a, b, dual_a, dual_b) = val
+      i, j  = paired_indices[:, k]
+      paired_indices, dual_a, dual_b = jax.lax.cond(a[i]<b[j],
                                 dual_a_update,
                                 dual_b_update,
-                                *(I, J, dual_a, dual_b, i, j, k))
-
+                                *(paired_indices, dual_a, dual_b, i, j, k))
       min_ab = jnp.minimum(a[i], b[j])
-      P = P.at[i,j].set(min_ab)
+      mass_paired_indices = mass_paired_indices.at[k].set(min_ab)
       a = a.at[i].set(a[i] - min_ab)
       b = b.at[j].set(b[j] - min_ab)
 
-      return P, I, J, a, b, dual_a, dual_b
+      return mass_paired_indices, paired_indices, a, b, dual_a, dual_b
 
-    # main
-    init_val = (P, I, J, a, b, dual_a, dual_b)
-    P, I, J, a, b, dual_a, dual_b = jax.lax.fori_loop(0, q-1, body_fun, init_val)
+    # main loop
+    init_val = (mass_paired_indices, paired_indices, a, b, dual_a, dual_b)
+    mass_paired_indices, paired_indices, a, b, dual_a, dual_b = jax.lax.fori_loop(0, q-1, body_fun, init_val)
 
     p_final = jnp.maximum(a[-1], b[-1])
-    i, j  = I[-1], J[-1]
-    P = P.at[i,j].set(p_final)
+    mass_paired_indices = mass_paired_indices.at[-1].set(p_final)
 
-    return P, dual_a, dual_b
-
-
-@jax.tree_util.register_pytree_node_class
-class GSUnivariateSolver:
-  r"""Gauss–Seidel solver to compute 1D OT solution.
-
-  Computes 1-Dimensional optimal transport distance between two $1$-dimensional
-  point clouds using algorithm 1 in https://arxiv.org/pdf/2201.00730.pdf
-  """
-
-  def __call__(
-      self,
-      prob: linear_problem.LinearProblem,
-  ) -> GSUnivariateOutput:
-    """Computes Univariate Distance between 1D point clouds.
-
-    Args:
-      prob: Problem with a :attr:`~ott.problems.linear.LinearProblem.geom`
-        attribute, the two point clouds ``x`` and ``y``
-        (of respective sizes ``[n, d]`` and ``[m, d]``) and a ground
-        `TI cost <ott.geometry.costs.TICost>` between two scalars.
-        The ``[n,]`` and ``[m,]`` size probability weights vectors are stored
-        in attributes `:attr:`~ott.problems.linear.LinearProblem.a` and
-        :attr:`~ott.problems.linear.LinearProblem.b`.
-
-    Returns:
-      An output object, that holds the optimal transport plan as well as dual potentials 
-    """
-    geom = prob.geom
-    assert isinstance(geom, pointcloud.PointCloud), \
-      "Geometry object in problem must be a PointCloud."
-    assert isinstance(geom.cost_fn, costs.TICost), \
-      "Geometry's cost must be translation invariant."
-    assert geom.x.shape[-1] == 1 and geom.y.shape[-1] == 1, \
-    "Univariate solver must be applied to point clouds of dimension 1."
-    
-    P, dual_a, dual_b = gauss_seidel_1Dsolver(x=geom.x, 
-                                              y=geom.y, 
-                                              a=prob.a, 
-                                              b=prob.b, 
-                                              cost_fn = geom.cost_fn)
-  
-    return GSUnivariateOutput(P=P, dual_a=dual_a, dual_b=dual_b)
-
-  def tree_flatten(self):  # noqa: D102
-    return None, (self.num_subsamples, self._quantiles)
-
-  @classmethod
-  def tree_unflatten(cls, aux_data, children):  # noqa: D102
-    del children
-    return cls(*aux_data)
-
+    ot_cost = jnp.sum(dual_a*a_original) + jnp.sum(dual_b*b_original)
+    return ot_cost, paired_indices, mass_paired_indices, dual_a, dual_b

@@ -391,3 +391,132 @@ def _quant_dist(
   ot_costs = jax.vmap(cost_fn.pairwise, in_axes=[1, 1])(x_q, y_q)
 
   return ot_costs / n_q, None, None, None, None
+
+
+@jax.tree_util.register_pytree_node_class
+class GSUnivariateSolver:
+  r"""Gauss–Seidel solver to compute 1D OT distance and return potentials.
+
+  Computes 1-Dimensional optimal transport distance between two $1$-dimensional
+  point clouds using algorithm 1 in https://arxiv.org/pdf/2201.00730.pdf
+  """
+
+  def __call__(
+      self,
+      prob: linear_problem.LinearProblem,
+  ) -> Tuple:
+    """Computes Univariate Distance between 1D point clouds.
+
+    Args:
+      prob: Problem with a :attr:`~ott.problems.linear.LinearProblem.geom`
+        attribute, the two point clouds ``x`` and ``y``
+        (of respective sizes ``[n, d]`` and ``[m, d]``) and a ground
+        `TI cost <ott.geometry.costs.TICost>` between two scalars.
+        The ``[n,]`` and ``[m,]`` size probability weights vectors are stored
+        in attributes `:attr:`~ott.problems.linear.LinearProblem.a` and
+        :attr:`~ott.problems.linear.LinearProblem.b`.
+      return_transport: Whether to return pairs of matched indices used to
+        compute optimal transport matrices.
+      return_dual_vectors: Whether to return pairs of dual vectors
+      rng: Used for random downsampling, if specified in the solver.
+
+    Returns:
+      An output object, that computes the OT costs, 
+    """
+    geom = prob.geom
+    assert isinstance(geom, pointcloud.PointCloud), \
+      "Geometry object in problem must be a PointCloud."
+    assert isinstance(geom.cost_fn, costs.TICost), \
+      "Geometry's cost must be translation invariant."
+
+    assert geom.x.shape[-1] == 1 and geom.y.shape[-1] == 1, \
+    "Univariate solver must be applied to point clouds of dimension 1"
+    
+    x, y = geom.x, geom.y
+
+    P, dual_a, dual_b = gauss_seidel_1Dsolver(x=x, 
+                                              y=y, 
+                                              a=prob.a, 
+                                              b=prob.b, 
+                                              cost_fn = geom.cost_fn)
+    
+    
+    cost_dual =  jnp.sum(dual_a*prob.a) + jnp.sum(dual_b * prob.b)
+
+    return P, cost_dual, dual_a, dual_b
+
+  def tree_flatten(self):  # noqa: D102
+    return None, (self.num_subsamples, self._quantiles)
+
+  @classmethod
+  def tree_unflatten(cls, aux_data, children):  # noqa: D102
+    del children
+    return cls(*aux_data)
+
+@jax.jit
+def gauss_seidel_1Dsolver(x: jnp.ndarray, 
+                          y: jnp.ndarray, 
+                          a: jnp.ndarray, 
+                          b: jnp.ndarray, 
+                          cost_fn: costs.TICost,):
+    
+    # sort entries
+    x, i_x = mu.sort_and_argsort(x, argsort=True)
+    y, i_y = mu.sort_and_argsort(y, argsort=True)
+    a = a[i_x]
+    b = b[i_y]
+
+    # compute cost matrix
+    cost_matrix = cost_fn.pairwise(x, y)
+
+    n, m = len(a), len(b)
+
+    # cumulative idx
+    q = m+n-1
+    I = J = jnp.zeros(q, dtype=int)
+
+    # transport matrix
+    P = jnp.zeros((n,m))
+                  
+    # init duals
+    dual_a, dual_b = jnp.zeros(n), jnp.zeros(m)
+    dual_b = dual_b.at[0].set(cost_matrix[0,0])
+
+    # helper functions
+    def dual_a_update(I, J, dual_a, dual_b, i, j, k):
+      I = I.at[k+1].set(i+1)
+      J = J.at[k+1].set(j)
+      dual_a = dual_a.at[i+1].set(cost_matrix[i+1,j] - dual_b[j])
+      return I, J, dual_a, dual_b
+
+    def dual_b_update(I, J, dual_a, dual_b, i, j, k):
+      I = I.at[k+1].set(i)
+      J = J.at[k+1].set(j+1)
+      dual_b = dual_b.at[j+1].set(cost_matrix[i,j+1] - dual_a[i])
+      return I, J, dual_a, dual_b
+
+    def body_fun(k, val):
+      (P, I, J, a, b, dual_a, dual_b) = val
+      i, j  = I[k], J[k]
+      I, J, dual_a, dual_b = jax.lax.cond(a[i]<b[j],
+                                dual_a_update,
+                                dual_b_update,
+                                *(I, J, dual_a, dual_b, i, j, k))
+
+      min_ab = jnp.minimum(a[i], b[j])
+      P = P.at[i,j].set(min_ab)
+      a = a.at[i].set(a[i] - min_ab)
+      b = b.at[j].set(b[j] - min_ab)
+
+      return P, I, J, a, b, dual_a, dual_b
+
+    # main
+    init_val = (P, I, J, a, b, dual_a, dual_b)
+    P, I, J, a, b, dual_a, dual_b = jax.lax.fori_loop(0, q-1, body_fun, init_val)
+
+    p_final = jnp.maximum(a[-1], b[-1])
+    i, j  = I[-1], J[-1]
+    P = P.at[i,j].set(p_final)
+
+    return P, dual_a, dual_b
+

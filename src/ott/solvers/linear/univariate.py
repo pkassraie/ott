@@ -510,7 +510,7 @@ class GSUnivariateSolver:
   def __call__(
       self,
       prob: linear_problem.LinearProblem,
-  ) -> Tuple:
+  ) -> GSUnivariateOutput:
     """Computes Univariate Distance between 1D point clouds.
 
     Args:
@@ -533,13 +533,11 @@ class GSUnivariateSolver:
     assert geom.x.shape[-1] == 1 and geom.y.shape[-1] == 1, \
     "Univariate solver must be applied to point clouds of dimension 1."
     
-    x, y = geom.x, geom.y
-    P, dual_a, dual_b = gauss_seidel_1Dsolver(x=x, 
-                                              y=y, 
+    P, dual_a, dual_b = gauss_seidel_1Dsolver(x=geom.x, 
+                                              y=geom.y, 
                                               a=prob.a, 
                                               b=prob.b, 
                                               cost_fn = geom.cost_fn)
-    
   
     return GSUnivariateOutput(P=P, dual_a=dual_a, dual_b=dual_b)
 

@@ -215,9 +215,7 @@ class UnivariateSolver:
       return_transport = return_transport and not self.num_subsamples
       out = uniform_distance(x, y, geom.cost_fn, return_transport)
     elif self.use_gauss_seidel:
-      fn = jax.vmap(
-          gauss_seidel_1D_solver, in_axes=[1, 1, None, None, None]
-      )
+      fn = jax.vmap(gauss_seidel_1D_solver, in_axes=[1, 1, None, None, None])
       out = fn(x, y, geom.cost_fn, prob.a, prob.b)
     else:
       fn = jax.vmap(
@@ -227,7 +225,6 @@ class UnivariateSolver:
           x, y, geom.cost_fn, prob.a, prob.b, return_transport,
           return_dual_vectors
       )
-
 
     return UnivariateOutput(prob, *out)
 
@@ -401,94 +398,95 @@ def _quant_dist(
   return ot_costs / n_q, None, None, None, None
 
 
-def gauss_seidel_1D_solver(x: jnp.ndarray,
-                           y: jnp.ndarray,
-                           cost_fn: costs.TICost,
-                           a: jnp.ndarray,
-                           b: jnp.ndarray,
-                           *args, **kwargs
-                        ) -> Distance_t:
-    """Computes Univariate Distance between 1D point clouds.
+def gauss_seidel_1D_solver(
+    x: jnp.ndarray,
+    y: jnp.ndarray,
+    cost_fn: costs.TICost,
+    a: jnp.ndarray,
+    b: jnp.ndarray,
+) -> Distance_t:
+  r"""Computes Univariate Distance between 1D point clouds.
 
-    Args:
-      x:  dual_a: ``[n,1]`` point cloud x
-      y:  dual_a: ``[m,1]`` point cloud y
-      a:  dual_a: ``[m]`` probability weights for point cloud x
-      b:  dual_a: ``[m]`` probability weights for point cloud y
-      cost_fn: Transport cost function, i.e. ``c: \mathbb{R} \times \mathbb{R} \rightarrow \mathbb{R} `.
+  Args:
+    x:  dual_a: ``[n,]`` point cloud x
+    y:  dual_a: ``[m,]`` point cloud y
+    cost_fn: Cost function.
+    a:  dual_a: ``[m]`` probability weights for point cloud x
+    b:  dual_a: ``[m]`` probability weights for point cloud y
 
-    Returns:
-      optimal transport cost: float
-      paired_indices: ``None`` if no transport was computed / recorded (e.g. when
-        using quantiles or subsampling approximations). Otherwise, output a tensor
-        of shape ``[d, 2, m+n]``, of ``m+n`` pairs of indices, for which the
-        optimal transport assigns mass, on each slice of the ``d`` slices
-        described in the dataset. Namely, for each index ``0<=k<m+n``, ``0<=s<d``,
-        if one has ``i:=paired_indices[s,0,k]`` and ``j:=paired_indices[s,1,k]``,
-        then point ``i`` in the first point cloud sends mass to point ``j`` in the
-        second, in slice ``s``.
-      mass_paired_indices: ``[d, n+m]`` array of weights. Using notation above, if
-        ``0<=k<n+m``, and ``0<=s<d``  then writing ``i:=paired_indices[s,0,k]``
-        and ``j=paired_indices[s,1,k]``, point ``i`` sends
-          ``mass_paired_indices[s,k]`` to point ``j``.
-      dual_a: ``[n,]`` array of dual values
-      dual_b: ``[m,]`` array of dual values
-    """
+  Returns:
+    optimal transport cost: float
+    paired_indices: ``None`` if no transport was computed / recorded (e.g. when
+    using quantiles or subsampling approximations). Otherwise, output a tensor
+    of shape ``[d, 2, m+n]``, of ``m+n`` pairs of indices, for which the
+    optimal transport assigns mass, on each slice of the ``d`` slices
+    described in the dataset. Namely, for each index ``0<=k<m+n``, ``0<=s<d``,
+    if one has ``i:=paired_indices[s,0,k]`` and ``j:=paired_indices[s,1,k]``,
+    then point ``i`` in the first point cloud sends mass to point ``j`` in the
+    second, in slice ``s``.
+    mass_paired_indices: ``[d, n+m]`` array of weights. Using notation above, if
+    ``0<=k<n+m``, and ``0<=s<d``  then writing ``i:=paired_indices[s,0,k]``
+    and ``j=paired_indices[s,1,k]``, point ``i`` sends
+    ``mass_paired_indices[s,k]`` to point ``j``.
+    dual_a: ``[n,]`` array of dual values
+    dual_b: ``[m,]`` array of dual values
+  """
+  n, m = len(a), len(b)
+  q = m + n - 1
 
-    n, m = len(a), len(b)
-    q = m+n-1
+  # sort entries
+  x, i_x = mu.sort_and_argsort(x, argsort=True)
+  y, i_y = mu.sort_and_argsort(y, argsort=True)
+  a = a[i_x]
+  b = b[i_y]
+  a_original = a.copy()
+  b_original = b.copy()
 
-    # sort entries
-    x, i_x = mu.sort_and_argsort(x, argsort=True)
-    y, i_y = mu.sort_and_argsort(y, argsort=True)
-    a = a[i_x]
-    b = b[i_y]
-    a_original = a.copy()
-    b_original = b.copy()
+  # compute cost matrix
+  cost_matrix = cost_fn.all_pairs(x[:, None], y[:, None])
 
-    # compute cost matrix
-    cost_matrix = cost_fn.pairwise(x, y)
+  # cumulative idx
 
-    # cumulative idx
-    
-    paired_indices = jnp.zeros((2,q), dtype=int)
-    mass_paired_indices = jnp.zeros(q)
-                  
-    # init duals
-    dual_a, dual_b = jnp.zeros(n), jnp.zeros(m)
-    dual_b = dual_b.at[0].set(cost_matrix[0,0])
+  paired_indices = jnp.zeros((2, q), dtype=int)
+  mass_paired_indices = jnp.zeros(q)
 
-    # helper functions
-    def dual_a_update(paired_indices, dual_a, dual_b, i, j, k):
-      paired_indices = paired_indices.at[:,k+1].set(jnp.array([i+1, j]))
-      dual_a = dual_a.at[i+1].set(cost_matrix[i+1,j] - dual_b[j])
-      return paired_indices, dual_a, dual_b
+  # init duals
+  dual_a, dual_b = jnp.zeros(n), jnp.zeros(m)
+  dual_b = dual_b.at[0].set(cost_matrix[0, 0])
 
-    def dual_b_update(paired_indices, dual_a, dual_b, i, j, k):
-      paired_indices = paired_indices.at[:,k+1].set(jnp.array([i, j+1]))
-      dual_b = dual_b.at[j+1].set(cost_matrix[i,j+1] - dual_a[i])
-      return paired_indices, dual_a, dual_b
+  # helper functions
+  def dual_a_update(paired_indices, dual_a, dual_b, i, j, k):
+    paired_indices = paired_indices.at[:, k + 1].set(jnp.array([i + 1, j]))
+    dual_a = dual_a.at[i + 1].set(cost_matrix[i + 1, j] - dual_b[j])
+    return paired_indices, dual_a, dual_b
 
-    def body_fun(k, val):
-      (mass_paired_indices, paired_indices, a, b, dual_a, dual_b) = val
-      i, j  = paired_indices[:, k]
-      paired_indices, dual_a, dual_b = jax.lax.cond(a[i]<b[j],
-                                dual_a_update,
-                                dual_b_update,
-                                *(paired_indices, dual_a, dual_b, i, j, k))
-      min_ab = jnp.minimum(a[i], b[j])
-      mass_paired_indices = mass_paired_indices.at[k].set(min_ab)
-      a = a.at[i].set(a[i] - min_ab)
-      b = b.at[j].set(b[j] - min_ab)
+  def dual_b_update(paired_indices, dual_a, dual_b, i, j, k):
+    paired_indices = paired_indices.at[:, k + 1].set(jnp.array([i, j + 1]))
+    dual_b = dual_b.at[j + 1].set(cost_matrix[i, j + 1] - dual_a[i])
+    return paired_indices, dual_a, dual_b
 
-      return mass_paired_indices, paired_indices, a, b, dual_a, dual_b
+  def body_fun(k, val):
+    (mass_paired_indices, paired_indices, a, b, dual_a, dual_b) = val
+    i, j = paired_indices[:, k]
+    paired_indices, dual_a, dual_b = jax.lax.cond(
+        a[i] < b[j], dual_a_update, dual_b_update,
+        *(paired_indices, dual_a, dual_b, i, j, k)
+    )
+    min_ab = jnp.minimum(a[i], b[j])
+    mass_paired_indices = mass_paired_indices.at[k].set(min_ab)
+    a = a.at[i].set(a[i] - min_ab)
+    b = b.at[j].set(b[j] - min_ab)
 
-    # main loop
-    init_val = (mass_paired_indices, paired_indices, a, b, dual_a, dual_b)
-    mass_paired_indices, paired_indices, a, b, dual_a, dual_b = jax.lax.fori_loop(0, q-1, body_fun, init_val)
+    return mass_paired_indices, paired_indices, a, b, dual_a, dual_b
 
-    p_final = jnp.maximum(a[-1], b[-1])
-    mass_paired_indices = mass_paired_indices.at[-1].set(p_final)
+  # main loop
+  init_val = (mass_paired_indices, paired_indices, a, b, dual_a, dual_b)
+  mass_paired_indices, paired_indices, a, b, dual_a, dual_b = jax.lax.fori_loop(
+      0, q - 1, body_fun, init_val
+  )
 
-    ot_cost = jnp.sum(dual_a*a_original) + jnp.sum(dual_b*b_original)
-    return ot_cost, paired_indices, mass_paired_indices, dual_a, dual_b
+  p_final = jnp.maximum(a[-1], b[-1])
+  mass_paired_indices = mass_paired_indices.at[-1].set(p_final)
+
+  ot_cost = jnp.sum(dual_a * a_original) + jnp.sum(dual_b * b_original)
+  return ot_cost, paired_indices, mass_paired_indices, dual_a, dual_b

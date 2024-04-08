@@ -394,56 +394,21 @@ def _quant_dist(
 
 
 @jax.tree_util.register_pytree_node_class
-class GSUnivariateSolver:
-  r"""Gauss–Seidel solver to compute 1D OT distance and return potentials.
+class GSUnivariateOutput(NamedTuple):  # noqa: D101
+  """Output of the :class:`~ott.solvers.linear.GSUnivariateSolver`.
 
-  Computes 1-Dimensional optimal transport distance between two $1$-dimensional
-  point clouds using algorithm 1 in https://arxiv.org/pdf/2201.00730.pdf
+  Objects of this class contain both solutions and problem definition of a
+  univariate OT problem.
+
+  Args:
+    prob: OT problem between 2 weighted ``[n, d]`` and ``[m, d]`` point clouds.
+    P: ``[n,m]`` array optimal coupling matrix
+    dual_a: ``[n,]`` array of dual values
+    dual_b: ``[m,]`` array of dual values
   """
-
-  def __call__(
-      self,
-      prob: linear_problem.LinearProblem,
-  ) -> Tuple:
-    """Computes Univariate Distance between 1D point clouds.
-
-    Args:
-      prob: Problem with a :attr:`~ott.problems.linear.LinearProblem.geom`
-        attribute, the two point clouds ``x`` and ``y``
-        (of respective sizes ``[n, d]`` and ``[m, d]``) and a ground
-        `TI cost <ott.geometry.costs.TICost>` between two scalars.
-        The ``[n,]`` and ``[m,]`` size probability weights vectors are stored
-        in attributes `:attr:`~ott.problems.linear.LinearProblem.a` and
-        :attr:`~ott.problems.linear.LinearProblem.b`.
-      return_transport: Whether to return pairs of matched indices used to
-        compute optimal transport matrices.
-      return_dual_vectors: Whether to return pairs of dual vectors
-      rng: Used for random downsampling, if specified in the solver.
-
-    Returns:
-      An output object, that computes the OT costs, 
-    """
-    geom = prob.geom
-    assert isinstance(geom, pointcloud.PointCloud), \
-      "Geometry object in problem must be a PointCloud."
-    assert isinstance(geom.cost_fn, costs.TICost), \
-      "Geometry's cost must be translation invariant."
-
-    assert geom.x.shape[-1] == 1 and geom.y.shape[-1] == 1, \
-    "Univariate solver must be applied to point clouds of dimension 1"
-    
-    x, y = geom.x, geom.y
-
-    P, dual_a, dual_b = gauss_seidel_1Dsolver(x=x, 
-                                              y=y, 
-                                              a=prob.a, 
-                                              b=prob.b, 
-                                              cost_fn = geom.cost_fn)
-    
-    
-    cost_dual =  jnp.sum(dual_a*prob.a) + jnp.sum(dual_b * prob.b)
-
-    return P, cost_dual, dual_a, dual_b
+  prob: linear_problem.LinearProblem
+  dual_a: jnp.ndarray
+  dual_b: jnp.ndarray
 
   def tree_flatten(self):  # noqa: D102
     return None, (self.num_subsamples, self._quantiles)
@@ -453,7 +418,6 @@ class GSUnivariateSolver:
     del children
     return cls(*aux_data)
 
-@jax.jit
 def gauss_seidel_1Dsolver(x: jnp.ndarray, 
                           y: jnp.ndarray, 
                           a: jnp.ndarray, 
@@ -519,4 +483,57 @@ def gauss_seidel_1Dsolver(x: jnp.ndarray,
     P = P.at[i,j].set(p_final)
 
     return P, dual_a, dual_b
+
+
+@jax.tree_util.register_pytree_node_class
+class GSUnivariateSolver:
+  r"""Gauss–Seidel solver to compute 1D OT solution.
+
+  Computes 1-Dimensional optimal transport distance between two $1$-dimensional
+  point clouds using algorithm 1 in https://arxiv.org/pdf/2201.00730.pdf
+  """
+
+  def __call__(
+      self,
+      prob: linear_problem.LinearProblem,
+  ) -> Tuple:
+    """Computes Univariate Distance between 1D point clouds.
+
+    Args:
+      prob: Problem with a :attr:`~ott.problems.linear.LinearProblem.geom`
+        attribute, the two point clouds ``x`` and ``y``
+        (of respective sizes ``[n, d]`` and ``[m, d]``) and a ground
+        `TI cost <ott.geometry.costs.TICost>` between two scalars.
+        The ``[n,]`` and ``[m,]`` size probability weights vectors are stored
+        in attributes `:attr:`~ott.problems.linear.LinearProblem.a` and
+        :attr:`~ott.problems.linear.LinearProblem.b`.
+
+    Returns:
+      An output tuple, that computes the OT costs and returns the primal coupling / transport plan as well as dual potentials 
+    """
+    geom = prob.geom
+    assert isinstance(geom, pointcloud.PointCloud), \
+      "Geometry object in problem must be a PointCloud."
+    assert isinstance(geom.cost_fn, costs.TICost), \
+      "Geometry's cost must be translation invariant."
+    assert geom.x.shape[-1] == 1 and geom.y.shape[-1] == 1, \
+    "Univariate solver must be applied to point clouds of dimension 1."
+    
+    x, y = geom.x, geom.y
+    P, dual_a, dual_b = gauss_seidel_1Dsolver(x=x, 
+                                              y=y, 
+                                              a=prob.a, 
+                                              b=prob.b, 
+                                              cost_fn = geom.cost_fn)
+    
+  
+    return GSUnivariateOutput(P=P, dual_a=dual_a, dual_b=dual_b)
+
+  def tree_flatten(self):  # noqa: D102
+    return None, (self.num_subsamples, self._quantiles)
+
+  @classmethod
+  def tree_unflatten(cls, aux_data, children):  # noqa: D102
+    del children
+    return cls(*aux_data)
 

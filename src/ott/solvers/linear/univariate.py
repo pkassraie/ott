@@ -435,21 +435,22 @@ def gauss_seidel_1D_solver(x: jnp.ndarray,
       dual_b: ``[m,]`` array of dual values
     """
 
+    n, m = len(a), len(b)
+    q = m+n-1
+
     # sort entries
     x, i_x = mu.sort_and_argsort(x, argsort=True)
     y, i_y = mu.sort_and_argsort(y, argsort=True)
     a = a[i_x]
     b = b[i_y]
-    a_original = a.copy
-    b_original = b.copy
+    a_original = a.copy()
+    b_original = b.copy()
 
     # compute cost matrix
     cost_matrix = cost_fn.pairwise(x, y)
 
-    n, m = len(a), len(b)
-
     # cumulative idx
-    q = m+n-1
+    
     paired_indices = jnp.zeros((2,q), dtype=int)
     mass_paired_indices = jnp.zeros(q)
                   

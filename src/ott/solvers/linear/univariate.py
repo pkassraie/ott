@@ -423,7 +423,21 @@ def gauss_seidel_1Dsolver(x: jnp.ndarray,
                           a: jnp.ndarray, 
                           b: jnp.ndarray, 
                           cost_fn: costs.TICost,):
-    
+    """Computes Univariate Distance between 1D point clouds.
+
+    Args:
+      x:  dual_a: ``[n,1]`` point cloud x
+      y:  dual_a: ``[m,1]`` point cloud y
+      a:  dual_a: ``[m]`` probability weights for point cloud x
+      b:  dual_a: ``[m]`` probability weights for point cloud y
+      cost_fn: Transport cost function, i.e. ``c: \mathbb{R} \times \mathbb{R} \rightarrow \mathbb{R} `.
+
+    Returns:
+        P: ``[n,m]`` array optimal coupling matrix
+        dual_a: ``[n,]`` array of dual values
+        dual_b: ``[m,]`` array of dual values
+    """
+
     # sort entries
     x, i_x = mu.sort_and_argsort(x, argsort=True)
     y, i_y = mu.sort_and_argsort(y, argsort=True)
@@ -509,7 +523,7 @@ class GSUnivariateSolver:
         :attr:`~ott.problems.linear.LinearProblem.b`.
 
     Returns:
-      An output tuple, that computes the OT costs and returns the primal coupling / transport plan as well as dual potentials 
+      An output object, that holds the optimal transport plan as well as dual potentials 
     """
     geom = prob.geom
     assert isinstance(geom, pointcloud.PointCloud), \
